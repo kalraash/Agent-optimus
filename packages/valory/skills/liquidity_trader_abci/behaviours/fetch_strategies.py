@@ -38,6 +38,7 @@ from packages.valory.contracts.gnosis_safe.contract import (
     GnosisSafeContract,
     SafeOperation,
 )
+from packages.valory.contracts.service_registry.contract import ServiceRegistryContract
 from packages.valory.contracts.sturdy_yearn_v3_vault.contract import (
     YearnV3VaultContract,
 )
@@ -54,8 +55,6 @@ from packages.valory.protocols.contract_api import ContractApiMessage
 from packages.valory.skills.abstract_round_abci.base import AbstractRound
 from packages.valory.skills.liquidity_trader_abci.behaviours.base import (
     DexType,
-    ETH_INITIAL_AMOUNT,
-    ETH_REMAINING_KEY,
     LiquidityTraderBaseBehaviour,
     PORTFOLIO_UPDATE_INTERVAL,
     PositionStatus,
@@ -64,6 +63,7 @@ from packages.valory.skills.liquidity_trader_abci.behaviours.base import (
     WHITELISTED_ASSETS,
     ZERO_ADDRESS,
 )
+from packages.valory.skills.liquidity_trader_abci.states.base import StakingState
 from packages.valory.skills.liquidity_trader_abci.states.fetch_strategies import (
     FetchStrategiesPayload,
     FetchStrategiesRound,
@@ -72,8 +72,8 @@ from packages.valory.skills.liquidity_trader_abci.states.post_tx_settlement impo
     PostTxSettlementRound,
 )
 from packages.valory.skills.liquidity_trader_abci.utils.tick_math import (
-    LiquidityAmounts,
-    TickMath,
+    get_amounts_for_liquidity,
+    get_sqrt_ratio_at_tick,
 )
 from packages.valory.skills.transaction_settlement_abci.payload_tools import (
     hash_payload_to_hex,
@@ -105,19 +105,14 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                 self.store_assets()
 
             self.read_assets()
-
             chain = self.params.target_investment_chains[0]
+            yield from self.update_accumulated_rewards_for_chain(chain)
+
             safe_address = self.params.safe_contract_addresses.get(chain)
 
             # update locally stored eth balance in-case it's incorrect
             eth_balance = yield from self._get_native_balance(chain, safe_address)
             self.context.logger.info(f"Current ETH balance: {eth_balance}")
-            if eth_balance < ETH_INITIAL_AMOUNT:
-                updated_amount = eth_balance
-                self.context.logger.info(
-                    f"Updating ETH remaining amount to: {updated_amount}"
-                )
-                yield from self._write_kv({ETH_REMAINING_KEY: str(updated_amount)})
 
             res = yield from self._track_eth_transfers_and_reversions(
                 safe_address, chain
@@ -207,6 +202,17 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                     chain_strategies = self.params.available_strategies.get(chain, [])
                     serialized_protocols.extend(chain_strategies)
 
+            # Update KV store if protocols were fixed
+            if (
+                serialized_protocols != json.loads(selected_protocols)
+                if selected_protocols
+                else []
+            ):
+                self.context.logger.info("Updating KV store with validated protocols")
+                yield from self._write_kv(
+                    {"selected_protocols": json.dumps(serialized_protocols)}
+                )
+
             if not trading_type:
                 trading_type = TradingType.BALANCED.value
 
@@ -265,7 +271,10 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
 
             # Check if we need to recalculate the portfolio
             self.context.logger.info("Checking if portfolio recalculation is needed")
-            if self.should_recalculate_portfolio(self.portfolio_data):
+            should_recalculate = yield from self.should_recalculate_portfolio(
+                self.portfolio_data
+            )
+            if should_recalculate:
                 self.context.logger.info("Recalculating user share values")
                 yield from self.calculate_user_share_values()
                 # Store the updated portfolio data
@@ -439,8 +448,17 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
             self.context.logger.error("Failed to fetch historical ETH price")
             return None
 
-    def should_recalculate_portfolio(self, last_portfolio_data: Dict) -> bool:
+    def should_recalculate_portfolio(
+        self, last_portfolio_data: Dict
+    ) -> Generator[None, None, bool]:
         """Determine if the portfolio should be recalculated."""
+        chain = self.params.target_investment_chains[0]
+        initial_investment = yield from self._load_chain_total_investment(chain)
+        final_value = last_portfolio_data.get("portfolio_value", None)
+
+        if initial_investment is None or final_value is None:
+            return True
+
         last_round_id = self.context.state.round_sequence._abci_app._previous_rounds[
             -1
         ].round_id
@@ -596,6 +614,24 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         initial_investment = (
             yield from self.calculate_initial_investment_value_from_funding_events()
         )
+
+        # If initial value calculations return None, use _load_chain_total_investment as fallback
+        if initial_investment is None:
+            chain = self.params.target_investment_chains[0]
+            total_investment = yield from self._load_chain_total_investment(chain)
+            self.context.logger.info(
+                f"Loaded {chain} investment from KV store: ${total_investment}"
+            )
+
+            if total_investment > 0:
+                initial_investment = total_investment
+                self.context.logger.info(
+                    f"Using total investment from KV store: ${initial_investment}"
+                )
+            else:
+                self.context.logger.warning(
+                    "No investment data found in KV store either"
+                )
         # Calculate total volume (total initial investment including closed positions)
         volume = yield from self._calculate_total_volume()
 
@@ -648,6 +684,34 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
             total_ratio = Decimal(0)
 
         # Update each entry with its ratio
+        # Filter out entries with negligible USD value (less than $0.01)
+        try:
+            filtered_breakdown = []
+            for entry in portfolio_breakdown:
+                try:
+                    # Handle potential missing or invalid value_usd
+                    value_usd = entry.get("value_usd")
+                    if value_usd is None:
+                        continue
+
+                    # Convert value_usd to Decimal safely
+                    value_usd_decimal = Decimal(str(value_usd))
+
+                    # Only keep entries >= 0.01
+                    if value_usd_decimal >= Decimal("0.01"):
+                        filtered_breakdown.append(entry)
+                except Exception as e:
+                    self.context.logger.warning(
+                        f"Error processing portfolio entry: {e}"
+                    )
+                    continue
+
+            portfolio_breakdown[:] = filtered_breakdown
+        except Exception as e:
+            self.context.logger.error(f"Error filtering portfolio breakdown: {e}")
+            # Keep original list in case of error
+            pass
+
         for entry in portfolio_breakdown:
             if total_value > 0 and total_ratio > 0:
                 entry["ratio"] = round(
@@ -894,19 +958,20 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
 
             # Then filter portfolio_breakdown to only include assets from allocations
             filtered_portfolio_breakdown = []
+
+            # Always show all portfolio breakdown entries to display complete portfolio
             for entry in portfolio_breakdown:
                 try:
-                    if entry.get("asset", "").lower() in allocation_assets:
-                        filtered_portfolio_breakdown.append(
-                            {
-                                "asset": entry["asset"],
-                                "address": entry["address"],
-                                "balance": float(entry["balance"]),
-                                "price": float(entry["price"]),
-                                "value_usd": float(entry["value_usd"]),
-                                "ratio": float(entry["ratio"]),
-                            }
-                        )
+                    filtered_portfolio_breakdown.append(
+                        {
+                            "asset": entry["asset"],
+                            "address": entry["address"],
+                            "balance": float(entry["balance"]),
+                            "price": float(entry["price"]),
+                            "value_usd": float(entry["value_usd"]),
+                            "ratio": float(entry["ratio"]),
+                        }
+                    )
                 except (KeyError, ValueError, TypeError) as e:
                     self.context.logger.error(
                         f"Error processing portfolio breakdown entry: {str(e)}"
@@ -1222,9 +1287,7 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
 
         # Handle position(s)
         positions_to_process = (
-            position.get("positions", [])
-            if isinstance(position.get("positions", []), list)
-            else [position]
+            position["positions"] if position.get("positions") else [position]
         )
 
         # Process all positions
@@ -1315,33 +1378,32 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
             f"and current tick is {current_tick}"
         )
 
-        # Check if current tick is within the provided tick range
+        # Always use get_amounts_for_liquidity for accurate calculation
+        # This handles both in-range and out-of-range positions correctly
+        sqrtA = get_sqrt_ratio_at_tick(tick_lower)
+        sqrtB = get_sqrt_ratio_at_tick(tick_upper)
+
+        # Calculate amounts using get_amounts_for_liquidity (same approach as Velodrome fix)
+        amount0, amount1 = get_amounts_for_liquidity(
+            sqrt_price_x96, sqrtA, sqrtB, liquidity
+        )
+
+        # Add uncollected fees
+        amount0 += tokens_owed0
+        amount1 += tokens_owed1
+
+        # Log the calculation results
         if tick_lower <= current_tick <= tick_upper:
-            # In range, use getAmountsForLiquidity
-            sqrtA = TickMath.getSqrtRatioAtTick(tick_lower)
-            sqrtB = TickMath.getSqrtRatioAtTick(tick_upper)
-
-            # Calculate amounts using getAmountsForLiquidity
-            amount0, amount1 = LiquidityAmounts.getAmountsForLiquidity(
-                sqrt_price_x96, sqrtA, sqrtB, liquidity
-            )
-
             self.context.logger.info(
                 f"Position is in range. Current tick: {current_tick}, "
-                f"Range: [{tick_lower}, {tick_upper})"
+                f"Range: [{tick_lower}, {tick_upper}], "
+                f"Calculated amounts: {amount0}/{amount1} (including fees: {tokens_owed0}/{tokens_owed1})"
             )
         else:
-            # Out of range, return invested amounts + tokensOwed
-            amount0 = position.get("amount0", 0)
-            amount1 = position.get("amount1", 0)
-
-            # Add uncollected fees (tokensOwed)
-            amount0 += tokens_owed0
-            amount1 += tokens_owed1
-
             self.context.logger.info(
                 f"Position is out of range. Current tick: {current_tick}, "
-                f"Range: [{tick_lower}, {tick_upper})"
+                f"Range: [{tick_lower}, {tick_upper}], "
+                f"Calculated amounts: {amount0}/{amount1} (including fees: {tokens_owed0}/{tokens_owed1})"
             )
 
         return amount0, amount1
@@ -1654,9 +1716,10 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
             self.context.logger.info(f"Calculating safe balances for chain {chain}")
 
             for token_address, token_symbol in chain_assets.items():
-                # Handle ETH (zero address) separately using get_eth_remaining_amount
                 if token_address == ZERO_ADDRESS:
-                    eth_balance_wei = yield from self.get_eth_remaining_amount()
+                    eth_balance_wei = yield from self._get_native_balance(
+                        chain, safe_address
+                    )
                     self.context.logger.info(
                         f"Token balance for {token_symbol} is {eth_balance_wei}."
                     )
@@ -1682,7 +1745,6 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                     self.context.logger.info(
                         f"Safe balance - {token_symbol}: {adjusted_balance} (${token_value_usd})"
                     )
-
                 else:
                     # Handle ERC20 tokens
                     token_balance = yield from self.contract_interact(
@@ -2440,15 +2502,21 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
             # Fetch token transfers
             self.context.logger.info("Fetching Mode token transfers...")
 
-            self._fetch_token_transfers_mode(
+            success = self._fetch_token_transfers_mode(
                 address, end_datetime, all_transfers_by_date, fetch_till_date
             )
+            if not success:
+                self.context.logger.info("No token transfers found for Mode")
+                all_transfers_by_date = self.funding_events["mode"]
 
             # Fetch ETH transfers
             self.context.logger.info("Fetching Mode ETH transfers...")
             self._fetch_eth_transfers_mode(
                 address, end_datetime, all_transfers_by_date, fetch_till_date
             )
+            if not success:
+                self.context.logger.info("No ETH transfers found for Mode")
+                all_transfers_by_date = self.funding_events["mode"]
 
             # Merge with existing data and save
             for date, transfers in all_transfers_by_date.items():
@@ -2475,7 +2543,9 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
 
         except Exception as e:
             self.context.logger.error(f"Error fetching Mode transfers: {e}")
-            return {}
+            self.read_funding_events()
+            all_transfers_by_date = self.funding_events.get("mode", {})
+            return all_transfers_by_date
 
     def _fetch_all_transfers_until_date_optimism(
         self, address: str, end_date: str
@@ -2712,7 +2782,7 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         target_date: str,
         all_transfers_by_date: dict,
         fetch_all_till_date: bool = False,
-    ) -> None:
+    ) -> bool:
         """
         Fetch token transfers from Mode blockchain explorer for a specific date or all transfers till that date.
 
@@ -2746,13 +2816,13 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                 endpoint,
                 params=params,
                 headers={"Accept": "application/json"},
-                verify=False,  # nosec B501
                 timeout=30,
+                verify=False,  # nosec B501
             )
 
             if not response.status_code == 200:
                 self.context.logger.error("Failed to fetch Mode token transfers")
-                return None
+                return False
 
             response_data = response.json()
             transfers = response_data.get("items", [])
@@ -2833,6 +2903,7 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         self.context.logger.info(
             f"Completed Mode token transfers {date_range}: {processed_count} found"
         )
+        return True
 
     def _fetch_eth_transfers_mode(
         self,
@@ -2840,7 +2911,7 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         target_date: str,
         all_transfers_by_date: dict,
         fetch_till_date: bool,
-    ) -> None:
+    ) -> bool:
         """Fetch ETH balance history from Mode blockchain explorer."""
         base_url = "https://explorer-mode-mainnet-0.t.conduit.xyz/api/v2"
         endpoint = f"{base_url}/addresses/{address}/coin-balance-history"
@@ -2866,13 +2937,13 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                 endpoint,
                 params=params,
                 headers={"Accept": "application/json"},
-                verify=False,  # nosec B501
                 timeout=30,
+                verify=False,  # nosec B501
             )
 
             if not response.status_code == 200:
                 self.context.logger.error("Failed to fetch Mode coin balance history")
-                return
+                return False
 
             response_data = response.json()
             balance_history = response_data.get("items", [])
@@ -2954,6 +3025,7 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         self.context.logger.info(
             f"Completed Mode coin balance history {date_range}: {processed_count} filtered transfers found"
         )
+        return True
 
     def _should_include_transfer_mode(
         self, from_address: dict, tx_data: dict = None, is_eth_transfer: bool = False
@@ -3278,10 +3350,16 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                 self.context.logger.warning(f"No transfers found for {chain} chain")
                 return {}
 
+            master_safe_address = yield from self.get_master_safe_address()
+            if not master_safe_address:
+                self.context.logger.error("No master safe address found")
+                return {}
+
+            self.context.logger.info(f"Master safe address: {master_safe_address}")
+
             # Track ETH transfers
             eth_transfers = []
             initial_funding = None
-            master_safe_address = None
             reversion_transfers = []
             historical_reversion_value = 0.0
             reversion_date = None
@@ -3314,8 +3392,6 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                             "from_address": transfer.get("from_address"),
                             "timestamp": transfer.get("timestamp"),
                         }
-                        if transfer.get("from_address"):
-                            master_safe_address = transfer.get("from_address").lower()
                         eth_transfers.append(transfer)
                     # If it's from the same address as initial funding
                     elif (
@@ -3475,8 +3551,8 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                     endpoint,
                     params=params,
                     headers={"Accept": "application/json"},
-                    verify=False,  # nosec B501
                     timeout=30,
+                    verify=False,  # nosec B501
                 )
 
                 if not response.status_code == 200:
@@ -3696,8 +3772,8 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
                 base_url,
                 params=params,
                 headers={"Accept": "application/json"},
-                verify=False,  # nosec B501
                 timeout=30,
+                verify=False,  # nosec B501
             )
 
             if response.status_code != 200:
@@ -3776,3 +3852,105 @@ class FetchStrategiesBehaviour(LiquidityTraderBaseBehaviour):
         except Exception as e:
             self.context.logger.error(f"Error tracking Mode ETH transfers: {e}")
             return {"incoming": {}, "outgoing": {}}
+
+    def get_master_safe_address(self) -> Generator[None, None, Optional[str]]:
+        """Get the master safe address by checking service staking state."""
+        # Get service_id from params
+        service_id = self.params.on_chain_service_id
+        if service_id is None:
+            self.context.logger.error("No service ID configured")
+            return None
+
+        if not self.params.target_investment_chains:
+            self.context.logger.error("No target investment chains configured")
+            return None
+
+        operating_chain = self.params.target_investment_chains[0]
+
+        staking_token_address = self.params.staking_token_contract_address
+        staking_chain = self.params.staking_chain
+
+        if staking_token_address and staking_chain:
+            if self.service_staking_state == StakingState.UNSTAKED:
+                yield from self._get_service_staking_state(chain=staking_chain)
+
+            if self.service_staking_state != StakingState.UNSTAKED:
+                service_info = yield from self._get_service_info(staking_chain)
+                if service_info and len(service_info) >= 2:
+                    master_safe_address = service_info[
+                        1
+                    ]  # owner field from service info struct
+                    self.context.logger.info(
+                        f"Master safe address: {master_safe_address}"
+                    )
+                    is_valid_address = yield from self.check_is_valid_safe_address(
+                        master_safe_address, staking_chain
+                    )
+                    if is_valid_address:
+                        return master_safe_address
+                    else:
+                        return None
+                else:
+                    self.context.logger.error(
+                        "Failed to get service info from staking contract"
+                    )
+                    return None
+
+        service_registry_address = self.params.service_registry_contract_addresses.get(
+            operating_chain
+        )
+        if not service_registry_address:
+            self.context.logger.error(
+                f"No service registry address configured for operating chain {operating_chain}"
+            )
+            return None
+
+        # Get service owner from service registry
+        service_owner_result = yield from self.contract_interact(
+            performative=ContractApiMessage.Performative.GET_RAW_TRANSACTION,
+            contract_address=service_registry_address,
+            contract_public_id=ServiceRegistryContract.contract_id,
+            contract_callable="get_service_owner",
+            data_key="service_owner",
+            service_id=service_id,
+            chain_id=operating_chain,
+        )
+
+        if service_owner_result:
+            master_safe_address = service_owner_result
+            self.context.logger.info(f"Master safe address: {master_safe_address}")
+            is_valid_address = yield from self.check_is_valid_safe_address(
+                master_safe_address, operating_chain
+            )
+            if is_valid_address:
+                return master_safe_address
+            else:
+                return None
+        else:
+            self.context.logger.error(
+                "Failed to get service owner from service registry"
+            )
+            return None
+
+    def check_is_valid_safe_address(
+        self, safe_address: str, operating_chain: str
+    ) -> Generator[None, None, bool]:
+        """Checks if an address is a GnosisSafe Contract"""
+        try:
+            res = yield from self.contract_interact(
+                performative=ContractApiMessage.Performative.GET_RAW_TRANSACTION,
+                contract_address=safe_address,
+                contract_public_id=GnosisSafeContract.contract_id,
+                contract_callable="get_owners",
+                data_key="owners",
+                chain_id=operating_chain,
+            )
+
+            if res:
+                return True
+
+            return False
+
+        except Exception:
+            self.context.logger.info("Not a GnosisSafe")
+            return False

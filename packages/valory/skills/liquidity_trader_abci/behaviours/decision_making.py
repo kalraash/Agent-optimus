@@ -194,9 +194,7 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
             return Event.DONE.value, {}
 
         if decision == Decision.CONTINUE:
-            res = yield from self._update_assets_after_swap(
-                actions, last_executed_action_index
-            )
+            res = self._update_assets_after_swap(actions, last_executed_action_index)
             return res
 
     def _wait_for_swap_confirmation(self) -> Generator[None, None, Optional[Decision]]:
@@ -212,7 +210,7 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
 
     def _update_assets_after_swap(
         self, actions, last_executed_action_index
-    ) -> Generator[None, None, Tuple[Optional[str], Optional[Dict]]]:
+    ) -> Tuple[Optional[str], Optional[Dict]]:
         """Update assets after a successful swap."""
         action = actions[last_executed_action_index]
 
@@ -227,22 +225,6 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
             action.get("to_token"),
             action.get("to_token_symbol"),
         )
-
-        # If this was an ETH swap, update the remaining ETH amount in kv_store
-        if action.get("from_token") == ZERO_ADDRESS:
-            # Get the amount that was swapped
-            amount_used = action.get("amount", 0)
-            if amount_used > 0:
-                self.context.logger.info(
-                    f"Updating remaining ETH amount after swap. Amount used: {amount_used}"
-                )
-                yield from self.update_eth_remaining_amount(amount_used)
-
-                # Log the new remaining amount
-                remaining_eth = yield from self.get_eth_remaining_amount()
-                self.context.logger.info(
-                    f"Remaining ETH amount after swap: {remaining_eth}"
-                )
 
         fee_details = {
             "remaining_fee_allowance": action.get("remaining_fee_allowance"),
@@ -967,7 +949,6 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
         positions: List[Dict[str, Any]],
         relative_funds_percentage: float = 1.0,
         max_investment_amounts: Optional[List[int]] = None,
-        eth_handling: bool = False,
     ) -> Generator[
         None, None, Tuple[Optional[List[int]], Optional[int], Optional[int]]
     ]:
@@ -1002,40 +983,11 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
                     ),
                 ]
 
-            # Handle ETH special case if enabled
-            if eth_handling:
-                if assets[0] == ZERO_ADDRESS:
-                    # For ETH (token0), get the remaining ETH amount from kv_store
-                    eth_remaining = yield from self.get_eth_remaining_amount()
-                    max_amounts_in = [
-                        int(
-                            min(eth_remaining, token0_balance)
-                            * relative_funds_percentage
-                        ),
-                        int(token1_balance * relative_funds_percentage),
-                    ]
-                elif assets[1] == ZERO_ADDRESS:
-                    # For ETH (token1), get the remaining ETH amount from kv_store
-                    eth_remaining = yield from self.get_eth_remaining_amount()
-                    max_amounts_in = [
-                        int(token0_balance * relative_funds_percentage),
-                        int(
-                            min(eth_remaining, token1_balance)
-                            * relative_funds_percentage
-                        ),
-                    ]
-                else:
-                    # For non-ETH tokens, use the original calculation
-                    max_amounts_in = [
-                        int(token0_balance * relative_funds_percentage),
-                        int(token1_balance * relative_funds_percentage),
-                    ]
-            else:
-                # Standard calculation without ETH handling
-                max_amounts_in = [
-                    int(token0_balance * relative_funds_percentage),
-                    int(token1_balance * relative_funds_percentage),
-                ]
+            # Standard calculation without ETH handling
+            max_amounts_in = [
+                int(token0_balance * relative_funds_percentage),
+                int(token1_balance * relative_funds_percentage),
+            ]
 
             # Ensure that allocated amounts do not exceed available balances
             max_amounts_in = [
@@ -1160,7 +1112,6 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
                     positions=positions,
                     relative_funds_percentage=relative_funds_percentage,
                     max_investment_amounts=max_investment_amounts,
-                    eth_handling=True,  # Enable ETH special handling
                 )
 
                 if max_amounts_in is None:
@@ -1199,7 +1150,6 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
                 positions=positions,
                 relative_funds_percentage=relative_funds_percentage,
                 max_investment_amounts=max_investment_amounts,
-                eth_handling=True,  # Enable ETH special handling
             )
 
             if max_amounts_in is None:
@@ -2097,16 +2047,6 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
 
         available_amount = self._get_balance(from_chain, from_token_address, positions)
 
-        # Apply ETH limit if the token is ETH (ZERO_ADDRESS)
-        if from_token_address == ZERO_ADDRESS:
-            # Get the remaining ETH amount from kv_store
-            eth_remaining = yield from self.get_eth_remaining_amount()
-            # Subsequent ETH swap - use what's left in our tracking
-            available_amount = min(eth_remaining, available_amount)
-            self.context.logger.info(
-                f"Subsequent ETH swap - using remaining tracked amount: {available_amount} wei"
-            )
-
         # Calculate the amount to swap based on the available amount and funds percentage
         amount = min(
             available_amount, int(available_amount * action.get("funds_percentage", 1))
@@ -2167,10 +2107,23 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
         )
 
         if routes_response.status_code != 200:
-            response = json.loads(routes_response.body)
-            self.context.logger.error(
-                f"[LiFi API Error Message] Error encountered: {response['message']}"
-            )
+            try:
+                response = json.loads(routes_response.body)
+                self.context.logger.error(
+                    f"[LiFi API Error Message] Error encountered: {response.get('message', 'Unknown error')}"
+                )
+            except (ValueError, TypeError):
+                error_msg = f"API returned status code {routes_response.status_code} with non-JSON response. "
+                if hasattr(routes_response, "body"):
+                    error_msg += f"Response body: {routes_response.body}"
+                else:
+                    error_msg += "Response body is missing"
+                self.context.logger.error(error_msg)
+            return None
+
+        # Check if response body is empty or None
+        if not routes_response.body:
+            self.context.logger.error("API returned empty response body")
             return None
 
         try:
@@ -2178,7 +2131,8 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
         except (ValueError, TypeError) as e:
             self.context.logger.error(
                 f"Could not parse response from api, "
-                f"the following error was encountered {type(e).__name__}: {e}"
+                f"the following error was encountered {type(e).__name__}: {e}. "
+                f"Response body: {routes_response.body[:500]}..."  # Log first 500 chars for debugging
             )
             return None
 
@@ -2250,6 +2204,14 @@ class DecisionMakingBehaviour(LiquidityTraderBaseBehaviour):
         )
 
         if response.status_code not in HTTP_OK:
+            # Handle 404 errors (project not found) by continuing execution
+            if response.status_code == 404:
+                self.context.logger.warning(
+                    f"Tenderly simulation failed with 404 (project not found) from url {api_url}. "
+                    f"Error Message: {response.body}. Continuing execution without simulation."
+                )
+                return True
+
             self.context.logger.error(
                 f"Could not retrieve data from url {api_url}. Status code {response.status_code}. Error Message {response.body}"
             )
